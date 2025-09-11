@@ -1,0 +1,128 @@
+/*
+  EMG thumb flexion with EMA baseline + latched hysteresis
+  - Plot columns (Serial Plotter @ 230400): env,ema,led
+  - LED on D13 turns on when env/ema > RATIO_ON and stays on
+    until env/ema < RATIO_OFF (with short persistence).
+*/
+
+#if defined(ARDUINO) && ARDUINO >= 100
+#include "Arduino.h"
+#else
+#include "WProgram.h"
+#endif
+#include "EMGFilters.h"
+
+#define SensorInputPin A0
+#define LED_PIN 13
+
+// -------- Settings --------
+const long  BAUD = 230400;
+const int   SAMPLE_RATE  = SAMPLE_FREQ_1000HZ; // or SAMPLE_FREQ_500HZ
+const int   HUM_NOTCH    = NOTCH_FREQ_50HZ;    // 60 Hz in NA/JP
+
+// Envelope shaping
+const float GAIN         = 1.5f;  // software gain (1.0–3.0)
+const float ALPHA_FAST   = 0.05f; // fast envelope (Value 1)
+const float ALPHA_SLOW_IDLE   = 0.005f; // slow EMA when LED is off
+const float ALPHA_SLOW_ACTIVE = 0.001f; // even slower EMA when LED is on
+
+// Hysteresis thresholds (ratio of env/EMA)
+const float RATIO_ON     = 1.6f;  // turn ON when env > EMA * RATIO_ON
+const float RATIO_OFF    = 1.3f;  // turn OFF when env < EMA * RATIO_OFF
+
+// Debounce/persistence (how long ratio must stay past threshold)
+const int   ON_HOLD_MS   = 40;    // ~40 ms above ON threshold to latch ON
+const int   OFF_HOLD_MS  = 80;    // ~80 ms below OFF threshold to latch OFF
+
+// Plotting
+const int   PRINT_EVERY_N = 10;   // ~100 Hz to plotter
+// --------------------------
+
+EMGFilters myFilter;
+unsigned long timeBudget;
+int   sampleHz;
+
+float envFast = 0.0f;  // Value 1 (fast envelope)
+float emaSlow = 0.0f;  // slow EMA baseline
+bool  ledOn   = false;
+
+int onHoldSamplesRequired  = 0;
+int offHoldSamplesRequired = 0;
+int onHoldCount  = 0;
+int offHoldCount = 0;
+
+int deci = 0;
+
+void setup() {
+  myFilter.init(SAMPLE_RATE, HUM_NOTCH, true, true, true);
+
+  sampleHz = (SAMPLE_RATE == SAMPLE_FREQ_1000HZ) ? 1000 : 500;
+  timeBudget = 1000000UL / sampleHz;
+
+  onHoldSamplesRequired  = (ON_HOLD_MS  * sampleHz) / 1000;
+  offHoldSamplesRequired = (OFF_HOLD_MS * sampleHz) / 1000;
+
+  pinMode(LED_PIN, OUTPUT);
+  Serial.begin(BAUD);
+
+  // Header for Serial Plotter
+  Serial.println(F("env,ema,led"));
+}
+
+void loop() {
+  unsigned long t0 = micros();
+
+  // 1) Read & filter
+  int raw  = analogRead(SensorInputPin);
+  int filt = myFilter.update(raw);
+
+  // 2) Rectified instant envelope with gain
+  float env = fabs((float)filt) * GAIN;
+
+  // 3) Fast envelope (Value 1) & slow EMA baseline
+  envFast += ALPHA_FAST * (env - envFast);
+
+  float alphaSlow = ledOn ? ALPHA_SLOW_ACTIVE : ALPHA_SLOW_IDLE;
+  emaSlow += alphaSlow * (env - emaSlow);
+
+  // Avoid divide-by-zero
+  float denom = (emaSlow > 1e-6f) ? emaSlow : 1e-6f;
+  float ratio = envFast / denom;
+
+  // 4) Latched hysteresis with persistence
+  if (!ledOn) {
+    if (ratio > RATIO_ON) {
+      if (++onHoldCount >= onHoldSamplesRequired) {
+        ledOn = true;
+        onHoldCount = 0;
+        offHoldCount = 0; // reset the other counter
+      }
+    } else {
+      onHoldCount = 0;
+    }
+  } else { // ledOn == true
+    if (ratio < RATIO_OFF) {
+      if (++offHoldCount >= offHoldSamplesRequired) {
+        ledOn = false;
+        offHoldCount = 0;
+        onHoldCount = 0; // reset the other counter
+      }
+    } else {
+      offHoldCount = 0;
+    }
+  }
+
+  digitalWrite(LED_PIN, ledOn ? HIGH : LOW);
+
+  // 5) Plot (env, ema, led)
+  if (++deci >= PRINT_EVERY_N) {
+    deci = 0;
+    Serial.print(envFast, 3); Serial.print(',');
+    Serial.print(emaSlow, 3); Serial.print(',');
+    Serial.println(ledOn ? 1 : 0);
+  }
+
+  // keep cadence
+  unsigned long dt = micros() - t0;
+  if (dt < timeBudget) delayMicroseconds(timeBudget - dt);
+}
