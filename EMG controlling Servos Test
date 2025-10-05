@@ -1,0 +1,123 @@
+/*
+  MyoMimic – Single EMG controls all 5 servos
+  - EMG input: GPIO25
+  - LED: GPIO2
+  - Servos: GPIO13, 14, 15, 16, 17
+  - Baseline calibration (2s)
+  - Threshold triggers all servos forward/backward
+*/
+
+#include <ESP32Servo.h>
+#include "EMGFilters.h"
+
+// ---------- Pin Setup ----------
+#define EMG_PIN 25
+#define LED_PIN 2
+int SERVO_PINS[5] = {13, 14, 15, 16, 17};
+
+// ---------- Objects ----------
+Servo servos[5];
+EMGFilters emgFilter;
+
+// ---------- Calibration ----------
+const int   SAMPLE_RATE         = SAMPLE_FREQ_1000HZ;
+const int   HUM_NOTCH           = NOTCH_FREQ_50HZ;
+const float GAIN                = 1.0f;
+const float CALIB_ALPHA         = 0.01f;
+const int   CALIBRATION_TIME_MS = 2000;
+float emaBaseline = 0.0f;
+
+// ---------- Filtering & Threshold ----------
+const float LPF_ALPHA  = 0.05f;
+const float THRESH_ON  = 160.0f;
+const float THRESH_OFF = 130.0f;
+float lpfVal = 0.0f;
+bool  active = false;
+
+// ---------- Servo Motion ----------
+const int SERVO_MIN = 0;
+const int SERVO_MAX = 180;
+int servoPos = 0;
+
+void setup() {
+  Serial.begin(230400);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  // Initialise EMG filter
+  emgFilter.init(SAMPLE_RATE, HUM_NOTCH, true, true, true);
+
+  // Attach all servos
+  for (int i = 0; i < 5; i++) {
+    servos[i].attach(SERVO_PINS[i]);
+    servos[i].write(SERVO_MIN);
+  }
+
+  // --- Calibration phase ---
+  Serial.println("Calibrating baseline... keep muscle relaxed");
+  unsigned long start = millis();
+  int count = 0;
+  while (millis() - start < CALIBRATION_TIME_MS) {
+    int raw = analogRead(EMG_PIN);
+    float env = emgFilter.update(raw) * GAIN;
+    emaBaseline = (CALIB_ALPHA * env) + ((1.0f - CALIB_ALPHA) * emaBaseline);
+
+    // Blink LED during calibration
+    if ((count / 50) % 2 == 0) digitalWrite(LED_PIN, HIGH);
+    else digitalWrite(LED_PIN, LOW);
+
+    delay(5);
+    count++;
+  }
+
+  digitalWrite(LED_PIN, LOW);
+  Serial.print("Calibration complete. Baseline = ");
+  Serial.println(emaBaseline);
+  delay(500);
+}
+
+void loop() {
+  // --- Read and process EMG ---
+  int raw = analogRead(EMG_PIN);
+  float env = emgFilter.update(raw) * GAIN;
+
+  float normVal = (env / (emaBaseline + 1)) * 100.0f;
+  lpfVal = lpfVal + LPF_ALPHA * (normVal - lpfVal);
+
+  // --- Threshold logic ---
+  if (!active && lpfVal > THRESH_ON) {
+    active = true;
+    digitalWrite(LED_PIN, HIGH);
+    Serial.println("Threshold reached → All servos flex");
+    allServosForward();
+  }
+  else if (active && lpfVal < THRESH_OFF) {
+    active = false;
+    digitalWrite(LED_PIN, LOW);
+    Serial.println("Below threshold → All servos extend");
+    allServosReverse();
+  }
+
+  // Plot filtered EMG value for Serial Plotter
+  Serial.println(lpfVal);
+  delay(5);
+}
+
+// ---------- Servo Sweep Functions ----------
+void allServosForward() {
+  for (servoPos = SERVO_MIN; servoPos <= SERVO_MAX; servoPos++) {
+    for (int i = 0; i < 5; i++) {
+      servos[i].write(servoPos);
+    }
+    delay(8);
+  }
+}
+
+void allServosReverse() {
+  for (servoPos = SERVO_MAX; servoPos >= SERVO_MIN; servoPos--) {
+    for (int i = 0; i < 5; i++) {
+      servos[i].write(servoPos);
+    }
+    delay(8);
+  }
+}
