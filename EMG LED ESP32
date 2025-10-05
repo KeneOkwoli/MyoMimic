@@ -1,13 +1,14 @@
 /*
-  ESP32 EMG Sensor Test with Low-Pass Filtering for LED Control
-  - Reads EMG signal on GPIO25
-  - Applies band-pass + EMA low-pass filtering
-  - LED on GPIO2 lights up when filtered EMG > threshold
+  ESP32 EMG LED Test with One-Time Baseline Calibration
+  - EMG input: GPIO25
+  - LED output: GPIO2
+  - Step 1: Capture baseline (EMA for 2s)
+  - Step 2: Freeze baseline and process EMG to drive LED
 */
 
 #include "EMGFilters.h"
 
-// ---------- Pin Setup ----------
+// ---------- Pins ----------
 #define EMG_PIN 25
 #define LED_PIN 2
 
@@ -16,15 +17,18 @@ const int   SAMPLE_RATE = SAMPLE_FREQ_1000HZ;
 const int   HUM_NOTCH   = NOTCH_FREQ_50HZ;
 EMGFilters emgFilter;
 
-// ---------- Signal Processing ----------
-const float GAIN          = 1.0f;
-const float EMA_ALPHA_BASE = 0.01f;  // baseline smoothing
-const float LPF_ALPHA      = 0.05f;  // low-pass smoothing for LED response
-const float LED_THRESH     = 150.0f; // threshold for activation
-
+// ---------- Calibration ----------
+const int   CALIBRATION_TIME_MS = 2000;  // 2 seconds for baseline
+const float CALIB_ALPHA         = 0.01f; // smoothing factor for baseline
 float emaBaseline = 0;
-float normalized  = 0;
-float filtered    = 0;
+
+// ---------- Processing ----------
+const float GAIN       = 1.0f;
+const float LPF_ALPHA  = 0.05f;   // low-pass smoothing
+const float THRESH_ON  = 160.0f;  // normalised threshold
+const float THRESH_OFF = 130.0f;
+float lpfVal = 0.0f;
+bool  active = false;
 
 void setup() {
   Serial.begin(230400);
@@ -32,38 +36,55 @@ void setup() {
   digitalWrite(LED_PIN, LOW);
 
   emgFilter.init(SAMPLE_RATE, HUM_NOTCH, true, true, true);
-  Serial.println("Starting EMG low-pass filter test...");
+
+  Serial.println("Calibrating baseline... keep muscle relaxed");
+  unsigned long start = millis();
+  int count = 0;
+
+  // --- CALIBRATION PHASE ---
+  while (millis() - start < CALIBRATION_TIME_MS) {
+    int raw = analogRead(EMG_PIN);
+    float env = emgFilter.update(raw) * GAIN;
+
+    // EMA baseline during calibration
+    emaBaseline = (CALIB_ALPHA * env) + ((1.0f - CALIB_ALPHA) * emaBaseline);
+    count++;
+
+    // Optional: blink LED during calibration
+    if ((count / 50) % 2 == 0) digitalWrite(LED_PIN, HIGH);
+    else digitalWrite(LED_PIN, LOW);
+
+    delay(5);
+  }
+
+  digitalWrite(LED_PIN, LOW);
+  Serial.print("Calibration complete. Baseline = ");
+  Serial.println(emaBaseline);
+  delay(500);
 }
 
 void loop() {
-  // ----- 1. Read and band-pass filter EMG signal -----
+  // --- Read & process EMG ---
   int raw = analogRead(EMG_PIN);
   float env = emgFilter.update(raw) * GAIN;
 
-  // ----- 2. Compute adaptive baseline (EMA) -----
-  emaBaseline = (EMA_ALPHA_BASE * env) + ((1 - EMA_ALPHA_BASE) * emaBaseline);
+  // Normalise using frozen baseline
+  float normVal = (env / (emaBaseline + 1)) * 100.0f;
 
-  // ----- 3. Normalise signal -----
-  normalized = (env / (emaBaseline + 1)) * 100;
+  // Low-pass filter for stability
+  lpfVal = lpfVal + LPF_ALPHA * (normVal - lpfVal);
 
-  // ----- 4. Apply low-pass smoothing (LPF) -----
-  filtered = filtered + LPF_ALPHA * (normalized - filtered);
-
-  // ----- 5. LED control -----
-  if (filtered > LED_THRESH) {
+  // Hysteresis for LED control
+  if (!active && lpfVal > THRESH_ON) {
+    active = true;
     digitalWrite(LED_PIN, HIGH);
-  } else {
+  } else if (active && lpfVal < THRESH_OFF) {
+    active = false;
     digitalWrite(LED_PIN, LOW);
   }
 
-  // ----- 6. Serial Plot Output -----
-  Serial.print(raw);
-  Serial.print(",");
-  Serial.print(normalized);
-  Serial.print(",");
-  Serial.print(filtered);
-  Serial.print(",");
-  Serial.println(LED_THRESH);
+  // Plot filtered signal (Value 2 only)
+  Serial.println(lpfVal);
 
   delay(5);
 }
