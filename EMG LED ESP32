@@ -1,0 +1,69 @@
+/*
+  ESP32 EMG Sensor Test with Low-Pass Filtering for LED Control
+  - Reads EMG signal on GPIO25
+  - Applies band-pass + EMA low-pass filtering
+  - LED on GPIO2 lights up when filtered EMG > threshold
+*/
+
+#include "EMGFilters.h"
+
+// ---------- Pin Setup ----------
+#define EMG_PIN 25
+#define LED_PIN 2
+
+// ---------- EMG Filter Settings ----------
+const int   SAMPLE_RATE = SAMPLE_FREQ_1000HZ;
+const int   HUM_NOTCH   = NOTCH_FREQ_50HZ;
+EMGFilters emgFilter;
+
+// ---------- Signal Processing ----------
+const float GAIN          = 1.0f;
+const float EMA_ALPHA_BASE = 0.01f;  // baseline smoothing
+const float LPF_ALPHA      = 0.05f;  // low-pass smoothing for LED response
+const float LED_THRESH     = 150.0f; // threshold for activation
+
+float emaBaseline = 0;
+float normalized  = 0;
+float filtered    = 0;
+
+void setup() {
+  Serial.begin(230400);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  emgFilter.init(SAMPLE_RATE, HUM_NOTCH, true, true, true);
+  Serial.println("Starting EMG low-pass filter test...");
+}
+
+void loop() {
+  // ----- 1. Read and band-pass filter EMG signal -----
+  int raw = analogRead(EMG_PIN);
+  float env = emgFilter.update(raw) * GAIN;
+
+  // ----- 2. Compute adaptive baseline (EMA) -----
+  emaBaseline = (EMA_ALPHA_BASE * env) + ((1 - EMA_ALPHA_BASE) * emaBaseline);
+
+  // ----- 3. Normalise signal -----
+  normalized = (env / (emaBaseline + 1)) * 100;
+
+  // ----- 4. Apply low-pass smoothing (LPF) -----
+  filtered = filtered + LPF_ALPHA * (normalized - filtered);
+
+  // ----- 5. LED control -----
+  if (filtered > LED_THRESH) {
+    digitalWrite(LED_PIN, HIGH);
+  } else {
+    digitalWrite(LED_PIN, LOW);
+  }
+
+  // ----- 6. Serial Plot Output -----
+  Serial.print(raw);
+  Serial.print(",");
+  Serial.print(normalized);
+  Serial.print(",");
+  Serial.print(filtered);
+  Serial.print(",");
+  Serial.println(LED_THRESH);
+
+  delay(5);
+}
