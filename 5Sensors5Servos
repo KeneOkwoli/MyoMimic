@@ -1,0 +1,208 @@
+/*
+  MyoMimic – Per-Finger Guided Calibration with Simultaneous Servo Updates
+  -----------------------------------------------------------------------
+  - EMG:   GPIO25, 26, 27, 32, 33
+  - Servos: GPIO13, 14, 15, 16, 17
+  - LED:   GPIO2
+
+  Features:
+  • Step 1: Relax (2 s) – baseline for all channels
+  • Step 2–6: Flex each finger individually when prompted
+  • Type 'r' in Serial Monitor to restart calibration
+  • Reads all EMG sensors first → updates all servos together
+*/
+
+#include <ESP32Servo.h>
+#include "EMGFilters.h"
+
+// ---------- Pin Setup ----------
+int EMG_PINS[5]   = {25, 26, 27, 32, 33};
+int SERVO_PINS[5] = {13, 14, 15, 16, 17};
+#define LED_PIN 2
+
+// ---------- Objects ----------
+Servo servos[5];
+EMGFilters filters[5];
+
+// ---------- Constants ----------
+const int   SAMPLE_RATE   = SAMPLE_FREQ_1000HZ;
+const int   HUM_NOTCH     = NOTCH_FREQ_50HZ;
+const float GAIN          = 1.0f;
+const int   CALM_RELAX_MS = 2000;
+const int   FLEX_MS       = 2000;
+
+const float BASELINE_ALPHA = 0.01f;
+const float LPF_ALPHA      = 0.02f;
+
+// ---------- Calibration Storage ----------
+float emaBaseline[5] = {0};
+float flexMax[5]     = {0};
+float lpfVal[5]      = {0};
+
+// ---------- Servo Parameters ----------
+const int SERVO_OPEN   = 0;
+const int SERVO_CLOSED = 160;
+int servoPos[5]        = {SERVO_OPEN};
+
+// ---------- Per-Finger Settings ----------
+float sensitivity[5] = {4.0f, 2.0f, 2.1f, 1.9f, 2.3f};     // thumb → little
+float threshold[5]   = {0.05f, 0.05f, 0.05f, 0.05f, 0.05f}; // dead zone
+
+// ---------- Timing ----------
+unsigned long lastUpd = 0;
+const int UPDATE_MS   = 20;
+
+// ---------- Function Prototypes ----------
+void runCalibration();
+
+void setup() {
+  Serial.begin(230400);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  for (int i = 0; i < 5; i++) {
+    filters[i].init(SAMPLE_RATE, HUM_NOTCH, true, true, true);
+    servos[i].attach(SERVO_PINS[i]);
+    servos[i].write(SERVO_OPEN);
+  }
+
+  Serial.println("\nMyoMimic Ready");
+  delay(500);
+  runCalibration();
+}
+
+void loop() {
+  // --- Listen for Serial commands ---
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'r' || c == 'R') {
+      Serial.println("\nRecalibration requested...");
+      runCalibration();
+    }
+  }
+
+  unsigned long now = millis();
+  if (now - lastUpd < UPDATE_MS) return;
+  lastUpd = now;
+
+  bool anyActive = false;
+
+  // --- Step 1: Read and process all EMG sensors ---
+  float rVals[5];
+  float targetAngles[5];
+
+  for (int i = 0; i < 5; i++) {
+    int raw = analogRead(EMG_PINS[i]);
+    float env = filters[i].update(raw) * GAIN;
+    float norm = (env / (emaBaseline[i] + 1)) * 100.0f;
+
+    // Smooth signal
+    lpfVal[i] = lpfVal[i] + LPF_ALPHA * (norm - lpfVal[i]);
+
+    // --- Map EMG to proportional activation r (0–1) ---
+    float denom = flexMax[i] - 100.0f;   // difference between rest & flex
+    if (denom < 10.0f) denom = 10.0f;    // avoid divide-by-small errors
+
+    float r = (lpfVal[i] - 100.0f) / denom;  // normalise reading
+
+// --- Dead zone (threshold) ---
+    if (r < threshold[i]) {
+      r = 0.0f;  // ignore small activations / noise
+}   else {
+  // Rescale range so motion starts *after* threshold
+    r = (r - threshold[i]) / (1.0f - threshold[i]);
+}
+
+// --- Clamp to 0–1 range ---
+    if (r < 0.0f) r = 0.0f;
+    if (r > 1.0f) r = 1.0f;
+
+// --- Apply per-finger sensitivity ---
+    r *= sensitivity[i];
+    if (r > 1.0f) r = 1.0f;
+
+    rVals[i] = r;  // store for simultaneous servo update
+
+  }
+
+  // --- Step 2: Convert all r-values to target servo angles ---
+  for (int i = 0; i < 5; i++) {
+    int target = SERVO_OPEN + (int)(rVals[i] * (SERVO_CLOSED - SERVO_OPEN));
+    targetAngles[i] = target;
+    if (rVals[i] > threshold[i]) anyActive = true;
+  }
+
+  // --- Step 3: Apply servo updates simultaneously ---
+  for (int i = 0; i < 5; i++) {
+    float diff = abs(servoPos[i] - targetAngles[i]);
+    if (diff > 2) {
+      servoPos[i] = 0.9f * servoPos[i] + 0.1f * targetAngles[i];
+      servos[i].write((int)servoPos[i]);
+    }
+  }
+
+  digitalWrite(LED_PIN, anyActive ? HIGH : LOW);
+
+  // --- Step 4: Serial Plotter output (optional) ---
+  Serial.print(lpfVal[0]); Serial.print(" ");
+  Serial.print(lpfVal[1]); Serial.print(" ");
+  Serial.print(lpfVal[2]); Serial.print(" ");
+  Serial.print(lpfVal[3]); Serial.print(" ");
+  Serial.println(lpfVal[4]);
+}
+
+// ---------- Full Calibration Routine ----------
+void runCalibration() {
+  const char* fingerNames[5] = {"Thumb", "Index", "Middle", "Ring", "Little"};
+  Serial.println("\nStarting Calibration Sequence...");
+  delay(800);
+
+  // ---- Step 1: Relax ----
+  Serial.println("Step 1/6: Keep your hand RELAXED for 2 seconds...");
+  unsigned long t0 = millis();
+  int blink = 0;
+  while (millis() - t0 < CALM_RELAX_MS) {
+    for (int i = 0; i < 5; i++) {
+      int raw = analogRead(EMG_PINS[i]);
+      float env = filters[i].update(raw) * GAIN;
+      emaBaseline[i] = BASELINE_ALPHA * env + (1.0f - BASELINE_ALPHA) * emaBaseline[i];
+    }
+    digitalWrite(LED_PIN, ((blink++ / 50) % 2) ? HIGH : LOW);
+    delay(5);
+  }
+  digitalWrite(LED_PIN, LOW);
+  Serial.println("Baseline recorded.");
+
+  // ---- Step 2–6: Per-finger flex calibration ----
+  for (int f = 0; f < 5; f++) {
+    Serial.println();
+    Serial.print("Step "); Serial.print(f + 2);
+    Serial.print("/6: FLEX your "); Serial.print(fingerNames[f]);
+    Serial.println(" finger for 2 seconds...");
+    delay(1000);
+
+    unsigned long start = millis();
+    flexMax[f] = 100.0f;
+    while (millis() - start < FLEX_MS) {
+      int raw = analogRead(EMG_PINS[f]);
+      float env = filters[f].update(raw) * GAIN;
+      float norm = (env / (emaBaseline[f] + 1)) * 100.0f;
+      lpfVal[f] = lpfVal[f] + 0.2f * (norm - lpfVal[f]);
+      if (lpfVal[f] > flexMax[f]) flexMax[f] = lpfVal[f];
+      digitalWrite(LED_PIN, HIGH);
+      delay(5);
+    }
+    digitalWrite(LED_PIN, LOW);
+    Serial.print("Finger "); Serial.print(fingerNames[f]);
+    Serial.print(" max = "); Serial.println(flexMax[f]);
+    delay(500);
+  }
+
+  // ---- Summary ----
+  Serial.println("\nCalibration Complete!");
+  for (int i = 0; i < 5; i++) {
+    Serial.print(fingerNames[i]); Serial.print(": Rest≈100  Max=");
+    Serial.println(flexMax[i], 1);
+  }
+  delay(1000);
+}
