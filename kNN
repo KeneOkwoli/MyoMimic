@@ -1,0 +1,215 @@
+/*
+  MyoMimic – kNN Gesture Classification + Servo Control (7 Gestures)
+  -----------------------------------------------------------------
+  - EMG:   GPIO25, 26, 27, 32, 33
+  - Servos: GPIO13, 14, 15, 16, 17
+  - LED:   GPIO2
+
+  Gestures:
+    0. Relax
+    1. Thumb flex
+    2. Index flex
+    3. Middle flex
+    4. Ring flex
+    5. Little flex
+    6. Full Fist (all closed)
+
+  Features:
+    • Guided calibration (2 s per gesture)
+    • Real-time classification using kNN (k = 1)
+    • Smooth servo control per finger
+    • Type 'r' in Serial Monitor to restart calibration
+*/
+
+#include <ESP32Servo.h>
+#include "EMGFilters.h"
+
+// ---------- Pin Setup ----------
+int EMG_PINS[5]   = {25, 26, 27, 32, 33};
+int SERVO_PINS[5] = {13, 14, 15, 16, 17};
+#define LED_PIN 2
+
+// ---------- Objects ----------
+Servo servos[5];
+EMGFilters filters[5];
+
+// ---------- Constants ----------
+const int SAMPLE_RATE = SAMPLE_FREQ_1000HZ;
+const int HUM_NOTCH   = NOTCH_FREQ_50HZ;
+const float GAIN      = 1.0f;
+const float LPF_ALPHA = 0.05f;
+const int CAL_TIME_MS = 2000;
+
+// ---------- Gestures ----------
+const int NUM_GESTURES = 7;   // Relax + 5 fingers + Fist
+const int NUM_SENSORS  = 5;
+float trainingData[NUM_GESTURES][NUM_SENSORS];
+
+const char* gestureNames[NUM_GESTURES] = {
+  "Relax", "Thumb", "Index", "Middle", "Ring", "Little", "Fist"
+};
+
+// ---------- Servo Parameters ----------
+const int SERVO_OPEN   = 0;
+const int SERVO_CLOSED = 160;
+int servoPos[5]        = {SERVO_OPEN};
+float lpfVal[NUM_SENSORS] = {0};
+
+// ---------- Timing ----------
+unsigned long lastUpdate = 0;
+const int UPDATE_MS = 100;
+
+// ---------- Function Prototypes ----------
+void calibrateGestures();
+int classifyGesture(float *current);
+void moveServosForGesture(int gestureID);
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    filters[i].init(SAMPLE_RATE, HUM_NOTCH, true, true, true);
+  }
+
+  for (int i = 0; i < 5; i++) {
+    servos[i].attach(SERVO_PINS[i]);
+    servos[i].write(SERVO_OPEN);
+  }
+
+  Serial.println("\nMyoMimic KNN Gesture Classifier + Servo Control");
+  delay(500);
+  calibrateGestures();
+}
+
+void loop() {
+  // --- Serial command: 'r' to recalibrate ---
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'r' || c == 'R') {
+      Serial.println("\nRecalibration requested...");
+      calibrateGestures();
+    }
+  }
+
+  unsigned long now = millis();
+  if (now - lastUpdate < UPDATE_MS) return;
+  lastUpdate = now;
+
+  // --- Read EMG sensors ---
+  float current[NUM_SENSORS];
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    int raw = analogRead(EMG_PINS[i]);
+    float env = filters[i].update(raw) * GAIN;
+    lpfVal[i] = lpfVal[i] + LPF_ALPHA * (env - lpfVal[i]);
+    current[i] = lpfVal[i];
+  }
+
+  // --- Classify gesture ---
+  int gestureID = classifyGesture(current);
+
+  // --- Move servos accordingly ---
+  moveServosForGesture(gestureID);
+
+  // --- Print detected gesture ---
+  Serial.print("Detected: ");
+  Serial.println(gestureNames[gestureID]);
+}
+
+// ---------- Calibration ----------
+void calibrateGestures() {
+  Serial.println("\nStarting Gesture Calibration...");
+  delay(800);
+
+  for (int g = 0; g < NUM_GESTURES; g++) {
+    Serial.println();
+    Serial.print("Perform gesture: ");
+    Serial.print(gestureNames[g]);
+    Serial.println(" (hold for 2 seconds)");
+
+    float sum[NUM_SENSORS] = {0};
+    int samples = 0;
+
+    unsigned long start = millis();
+    while (millis() - start < CAL_TIME_MS) {
+      for (int i = 0; i < NUM_SENSORS; i++) {
+        int raw = analogRead(EMG_PINS[i]);
+        float env = filters[i].update(raw) * GAIN;
+        sum[i] += env;
+      }
+      samples++;
+      digitalWrite(LED_PIN, (samples % 50 < 25) ? HIGH : LOW);
+      delay(5);
+    }
+    digitalWrite(LED_PIN, LOW);
+
+    for (int i = 0; i < NUM_SENSORS; i++) {
+      trainingData[g][i] = sum[i] / samples;
+    }
+
+    Serial.print("Gesture '");
+    Serial.print(gestureNames[g]);
+    Serial.println("' recorded.");
+  }
+
+  Serial.println("\nCalibration complete!");
+  for (int g = 0; g < NUM_GESTURES; g++) {
+    Serial.print(gestureNames[g]);
+    Serial.print(": ");
+    for (int i = 0; i < NUM_SENSORS; i++) {
+      Serial.print(trainingData[g][i], 1);
+      Serial.print(i < NUM_SENSORS - 1 ? ", " : "\n");
+    }
+  }
+}
+
+// ---------- kNN Classifier (k = 1) ----------
+int classifyGesture(float *current) {
+  float minDist = 1e9;
+  int bestGesture = 0;
+
+  for (int g = 0; g < NUM_GESTURES; g++) {
+    float d = 0;
+    for (int i = 0; i < NUM_SENSORS; i++) {
+      float diff = current[i] - trainingData[g][i];
+      d += diff * diff;
+    }
+    float dist = sqrt(d);
+    if (dist < minDist) {
+      minDist = dist;
+      bestGesture = g;
+    }
+  }
+  return bestGesture;
+}
+
+// ---------- Servo Mapping ----------
+void moveServosForGesture(int gestureID) {
+  int targets[5] = {SERVO_OPEN, SERVO_OPEN, SERVO_OPEN, SERVO_OPEN, SERVO_OPEN};
+
+  switch (gestureID) {
+    case 0: // Relax
+      break;
+    case 1: // Thumb
+      targets[0] = SERVO_CLOSED; break;
+    case 2: // Index
+      targets[1] = SERVO_CLOSED; break;
+    case 3: // Middle
+      targets[2] = SERVO_CLOSED; break;
+    case 4: // Ring
+      targets[3] = SERVO_CLOSED; break;
+    case 5: // Little
+      targets[4] = SERVO_CLOSED; break;
+    case 6: // Full Fist
+      for (int i = 0; i < 5; i++) targets[i] = SERVO_CLOSED;
+      break;
+  }
+
+  for (int i = 0; i < 5; i++) {
+    if (servoPos[i] != targets[i]) {
+      servoPos[i] = 0.8f * servoPos[i] + 0.2f * targets[i];
+      servos[i].write((int)servoPos[i]);
+    }
+  }
+}
