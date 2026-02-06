@@ -1,0 +1,441 @@
+/*
+   MyoMimic – Pure k-NN (No Servos, Enhanced Filtering) – 4 EMG Sensors
+   ---------------------------------------------------------------------
+   EMG layout:
+        CH0: Bicep      (GPIO33)
+        CH1: Forearm L  (GPIO25)
+        CH2: Forearm M  (GPIO26)
+        CH3: Forearm R  (GPIO27)
+
+   Gestures:
+        0: OpenPalm
+        1: Fist
+        2: Pinch
+        3: Peace
+
+   Feature vector (7 values):
+        [bN, f0N, f1N, f2N, M0, M1, M2]
+*/
+
+#include <Arduino.h>
+#include "EMGFilters.h"
+#include <math.h>
+
+#define NUM_EMG 4
+#define NUM_GESTURES 4
+#define FEATURE_DIM 7
+#define SAMPLES_PER_GESTURE 10  // Increased from 3 to 10
+
+int EMG_PINS[NUM_EMG] = {33, 25, 26, 27};
+
+const int SAMPLE_RATE = SAMPLE_FREQ_500HZ;
+const int HUM_FREQ    = NOTCH_FREQ_50HZ;
+
+const unsigned long CLASS_WINDOW_MS   = 200;  // Increased from 150ms
+const unsigned long PRINT_INTERVAL_MS = 300;
+
+// ---------------------------------- Kalman filter ----------------------------------
+struct Kalman1D {
+  float x, P, Q, R;
+  void init(float q, float r, float initialValue = 0.0f) {
+    Q = q; R = r;
+    x = initialValue; P = 1.0f;
+  }
+  float update(float z) {
+    P += Q;
+    float K = P / (P + R);
+    x = x + K * (z - x);
+    P = (1.0f - K) * P;
+    return x;
+  }
+};
+
+// Adjusted Kalman parameters for better stability
+const float KALMAN_Q = 100.0f;  // Reduced from 200 for smoother response
+const float KALMAN_R = 8000.0f; // Increased from 5000 for less noise sensitivity
+
+// ---------------------------------- Moving Average Filter --------------------------
+#define MA_WINDOW_SIZE 5
+struct MovingAverage {
+  float buffer[MA_WINDOW_SIZE];
+  int index;
+  float sum;
+  int count;
+  
+  void init() {
+    index = 0;
+    sum = 0;
+    count = 0;
+    for (int i = 0; i < MA_WINDOW_SIZE; i++) buffer[i] = 0;
+  }
+  
+  float update(float value) {
+    sum -= buffer[index];
+    buffer[index] = value;
+    sum += value;
+    index = (index + 1) % MA_WINDOW_SIZE;
+    if (count < MA_WINDOW_SIZE) count++;
+    return sum / count;
+  }
+};
+
+// ---------------------------------- Globals ----------------------------------------
+EMGFilters emgFilter[NUM_EMG];
+Kalman1D   kf[NUM_EMG];
+MovingAverage maFilter[NUM_EMG];
+
+int currentGesture = 0;  // This variable (0-3) can be used for ESP-NOW communication
+int lastGesture = -1;  // For change detection
+
+unsigned long lastSampleMicros = 0;
+const unsigned long SAMPLE_PERIOD_US = 1000000UL / SAMPLE_RATE;
+
+float rmsAccum[NUM_EMG] = {0};
+int   rmsCount = 0;
+unsigned long lastFeatureTime = 0;
+unsigned long lastPrintTime   = 0;
+
+// k-NN storage: gesture × sample × feature dimension
+float knnData[NUM_GESTURES][SAMPLES_PER_GESTURE][FEATURE_DIM];
+
+const char* gestureNames[NUM_GESTURES] = {
+  "OpenPalm", "Fist", "Pinch", "Peace"
+};
+
+// Gesture stability tracking
+#define STABILITY_BUFFER_SIZE 5
+int gestureHistory[STABILITY_BUFFER_SIZE];
+int historyIndex = 0;
+
+// ---------- Function prototypes ----------
+void runCalibration();
+void gestureCalibration();
+void computeRuntimeFeaturesAndClassify(const long *env);
+void buildFeatureVector(const float rms[NUM_EMG], float out[FEATURE_DIM]);
+int classifyGestureKNN(const float *feat);
+int getMostFrequentGesture();
+
+// ====================================================
+//                        SETUP
+// ====================================================
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  Serial.println("\nMyoMimic – Enhanced k-NN Version (No Servos)");
+
+  for (int i = 0; i < NUM_EMG; i++) {
+    emgFilter[i].init(SAMPLE_RATE, HUM_FREQ, true, true, true);
+    kf[i].init(KALMAN_Q, KALMAN_R);
+    maFilter[i].init();
+  }
+
+  // Initialize gesture history
+  for (int i = 0; i < STABILITY_BUFFER_SIZE; i++) {
+    gestureHistory[i] = 0;
+  }
+
+  runCalibration();
+  Serial.println("Calibration complete. System live.\n");
+  Serial.println("Output Format: Gesture [ID]: [NAME]");
+  Serial.println("--------------------------------------------");
+}
+
+// ====================================================
+//                         LOOP
+// ====================================================
+void loop() {
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'r' || c == 'R') runCalibration();
+  }
+
+  unsigned long nowMicros = micros();
+  if (nowMicros - lastSampleMicros < SAMPLE_PERIOD_US) return;
+  lastSampleMicros = nowMicros;
+
+  long env[NUM_EMG];
+
+  for (int i = 0; i < NUM_EMG; i++) {
+    int raw = analogRead(EMG_PINS[i]);
+    int filtered = emgFilter[i].update(raw);
+    long sq = (long)filtered * (long)filtered;
+
+    // Apply Kalman filter
+    float kEnv = kf[i].update((float)sq);
+    if (kEnv < 0) kEnv = 0;
+    
+    // Apply moving average for additional smoothing
+    kEnv = maFilter[i].update(kEnv);
+
+    env[i] = (long)kEnv;
+  }
+
+  computeRuntimeFeaturesAndClassify(env);
+
+  // Print only when gesture changes or at regular intervals
+  if (millis() - lastPrintTime > PRINT_INTERVAL_MS) {
+    lastPrintTime = millis();
+    
+    Serial.print("Gesture ");
+    Serial.print(currentGesture);
+    Serial.print(": ");
+    Serial.print(gestureNames[currentGesture]);
+    Serial.print(" | ENV: ");
+    for (int i = 0; i < NUM_EMG; i++) {
+      Serial.print(env[i]);
+      if (i < NUM_EMG - 1) Serial.print(", ");
+    }
+    Serial.println();
+  }
+}
+
+// ====================================================
+//                FEATURE EXTRACTION
+// ====================================================
+void computeRuntimeFeaturesAndClassify(const long *env) {
+  for (int i = 0; i < NUM_EMG; i++) {
+    float e = (float)env[i];
+    rmsAccum[i] += e * e;
+  }
+  rmsCount++;
+
+  if (millis() - lastFeatureTime >= CLASS_WINDOW_MS && rmsCount > 0) {
+    float rms[NUM_EMG];
+    for (int i = 0; i < NUM_EMG; i++) {
+      rms[i] = sqrt(rmsAccum[i] / rmsCount);
+      rmsAccum[i] = 0;
+    }
+    rmsCount = 0;
+    lastFeatureTime = millis();
+
+    float feat[FEATURE_DIM];
+    buildFeatureVector(rms, feat);
+
+    int rawGesture = classifyGestureKNN(feat);
+    
+    // Add to history for stability
+    gestureHistory[historyIndex] = rawGesture;
+    historyIndex = (historyIndex + 1) % STABILITY_BUFFER_SIZE;
+    
+    // Use majority voting for more stable classification
+    currentGesture = getMostFrequentGesture();
+  }
+}
+
+// ---------------------------------- Get Most Frequent Gesture --------------------------
+int getMostFrequentGesture() {
+  int counts[NUM_GESTURES] = {0};
+  
+  for (int i = 0; i < STABILITY_BUFFER_SIZE; i++) {
+    counts[gestureHistory[i]]++;
+  }
+  
+  int maxCount = 0;
+  int mostFrequent = 0;
+  for (int i = 0; i < NUM_GESTURES; i++) {
+    if (counts[i] > maxCount) {
+      maxCount = counts[i];
+      mostFrequent = i;
+    }
+  }
+  
+  return mostFrequent;
+}
+
+// ---------------------------------- Build 7-D Feature Vector ----------------------------------
+void buildFeatureVector(const float rms[NUM_EMG], float out[FEATURE_DIM]) {
+  float B = rms[0];
+  float F0 = rms[1];
+  float F1 = rms[2];
+  float F2 = rms[3];
+
+  float T = B + F0 + F1 + F2 + 1e-6;
+
+  // Normalized features
+  out[0] = B  / T;
+  out[1] = F0 / T;
+  out[2] = F1 / T;
+  out[3] = F2 / T;
+
+  // One-hot encoding for max forearm sensor
+  int maxF = 0;
+  float m = F0;
+  if (F1 > m) { m = F1; maxF = 1; }
+  if (F2 > m) { m = F2; maxF = 2; }
+
+  out[4] = (maxF == 0) ? 1 : 0;
+  out[5] = (maxF == 1) ? 1 : 0;
+  out[6] = (maxF == 2) ? 1 : 0;
+}
+
+// ====================================================
+//                   k-NN CLASSIFICATION
+// ====================================================
+int classifyGestureKNN(const float *feat) {
+  int votes[NUM_GESTURES] = {0};
+  const int K = 3;  // Use K=3 nearest neighbors
+  
+  // Store distances with gesture labels
+  struct DistanceLabel {
+    float dist;
+    int gesture;
+  };
+  
+  DistanceLabel allDistances[NUM_GESTURES * SAMPLES_PER_GESTURE];
+  int distIndex = 0;
+  
+  // Calculate all distances
+  for (int g = 0; g < NUM_GESTURES; g++) {
+    for (int s = 0; s < SAMPLES_PER_GESTURE; s++) {
+      float dist = 0;
+      for (int d = 0; d < FEATURE_DIM; d++) {
+        float diff = feat[d] - knnData[g][s][d];
+        dist += diff * diff;
+      }
+      allDistances[distIndex].dist = dist;
+      allDistances[distIndex].gesture = g;
+      distIndex++;
+    }
+  }
+  
+  // Simple selection sort to find K nearest (efficient for small K)
+  for (int i = 0; i < K; i++) {
+    int minIdx = i;
+    for (int j = i + 1; j < distIndex; j++) {
+      if (allDistances[j].dist < allDistances[minIdx].dist) {
+        minIdx = j;
+      }
+    }
+    // Swap
+    DistanceLabel temp = allDistances[i];
+    allDistances[i] = allDistances[minIdx];
+    allDistances[minIdx] = temp;
+    
+    // Vote for this neighbor's gesture
+    votes[allDistances[i].gesture]++;
+  }
+  
+  // Return gesture with most votes
+  int maxVotes = 0;
+  int bestGesture = 0;
+  for (int g = 0; g < NUM_GESTURES; g++) {
+    if (votes[g] > maxVotes) {
+      maxVotes = votes[g];
+      bestGesture = g;
+    }
+  }
+  
+  return bestGesture;
+}
+
+// ====================================================
+//                    CALIBRATION
+// ====================================================
+void runCalibration() {
+  Serial.println("\n========================================");
+  Serial.println("     k-NN Gesture Calibration");
+  Serial.println("========================================");
+  gestureCalibration();
+  Serial.println("\n========================================");
+  Serial.println("     Calibration Complete!");
+  Serial.println("========================================\n");
+}
+
+// ---------- Enhanced Gesture Calibration ----------
+void gestureCalibration() {
+  const unsigned long GESTURE_WINDOW_MS = 1500;
+  const unsigned long PREP_DELAY_MS = 2000;  // Time to prepare
+
+  for (int g = 0; g < NUM_GESTURES; g++) {
+    Serial.println();
+    Serial.print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    Serial.println();
+    Serial.print(gestureNames[g]);
+    Serial.print(": Gesture ");
+    Serial.println(g);
+    Serial.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    for (int s = 0; s < SAMPLES_PER_GESTURE; s++) {
+      Serial.println();
+      Serial.print("  Sample ");
+      Serial.print(s + 1);
+      Serial.print("/");
+      Serial.println(SAMPLES_PER_GESTURE);
+      Serial.print("  Prepare gesture in ");
+      
+      // Countdown
+      for (int countdown = 3; countdown > 0; countdown--) {
+        Serial.print(countdown);
+        Serial.print("... ");
+        delay(1000);
+      }
+      Serial.println("HOLD!");
+
+      // Reset filters for clean measurement
+      for (int i = 0; i < NUM_EMG; i++) {
+        kf[i].init(KALMAN_Q, KALMAN_R);
+        maFilter[i].init();
+      }
+
+      float accumSq[NUM_EMG] = {0};
+      int count = 0;
+      unsigned long start = millis();
+
+      // Collect data during gesture window
+      while (millis() - start < GESTURE_WINDOW_MS) {
+        for (int i = 0; i < NUM_EMG; i++) {
+          int raw = analogRead(EMG_PINS[i]);
+          int flt = emgFilter[i].update(raw);
+          long sq = (long)flt * (long)flt;
+          float kEnv = kf[i].update((float)sq);
+          if (kEnv < 0) kEnv = 0;
+          kEnv = maFilter[i].update(kEnv);
+          accumSq[i] += kEnv * kEnv;
+        }
+        count++;
+        delayMicroseconds(100);  // Small delay for stability
+      }
+
+      // Calculate RMS
+      float rms[NUM_EMG];
+      for (int i = 0; i < NUM_EMG; i++)
+        rms[i] = sqrt(accumSq[i] / count);
+
+      // Build and store feature vector
+      float feat[FEATURE_DIM];
+      buildFeatureVector(rms, feat);
+
+      for (int d = 0; d < FEATURE_DIM; d++)
+        knnData[g][s][d] = feat[d];
+
+      Serial.print("  ✓ Captured! Features: [");
+      for (int d = 0; d < FEATURE_DIM; d++) {
+        Serial.print(feat[d], 3);
+        if (d < FEATURE_DIM - 1) Serial.print(", ");
+      }
+      Serial.println("]");
+      
+      delay(500);  // Brief pause between samples
+    }
+    
+    Serial.println();
+    Serial.print("✓ Completed all samples for ");
+    Serial.print(gestureNames[g]);
+    Serial.print(" (Gesture ");
+    Serial.print(g);
+    Serial.println(")");
+    delay(1000);
+  }
+  
+  // Validate calibration
+  Serial.println("\n--- Validating Calibration ---");
+  for (int g = 0; g < NUM_GESTURES; g++) {
+    Serial.print(gestureNames[g]);
+    Serial.print(" (Gesture ");
+    Serial.print(g);
+    Serial.print("): ");
+    Serial.print(SAMPLES_PER_GESTURE);
+    Serial.println(" samples stored");
+  }
+}
